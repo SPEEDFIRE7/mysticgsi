@@ -1,0 +1,32 @@
+name: Check Disks
+
+on:
+  workflow_dispatch:        # تشغيل يدوي من تبويب Actions
+  push:
+    branches: [main]
+
+jobs:
+  check-disks:
+    runs-on: ubuntu-latest  # غيّرها إلى [self-hosted] إذا كان لديك سيرفر خاص
+
+    steps:
+      - name: قائمة الأقراص والأجهزة المتصلة
+        run: lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+
+      - name: المساحة المستخدمة والمتاحة
+        run: df -h
+
+      - name: تفاصيل الأقراص الفيزيائية
+        run: sudo fdisk -l 2>/dev/null || true
+
+      - name: التحقق من امتلاء القرص (تنبيه فوق 80%)
+        run: |
+          USAGE=$(df / --output=pcent | tail -1 | tr -dc '0-9')
+          echo "استخدام القرص الرئيسي: ${USAGE}%"
+          if [ "$USAGE" -gt 80 ]; then
+            echo "::warning::القرص ممتلئ بنسبة ${USAGE}%"
+          fi
+
+      # ضع هنا الخطوة التي تريد تنفيذها بعد التحقق
+      - name: خطوتك الخاصة
+        run: echo "تم التحقق، يمكنك المتابعة"
