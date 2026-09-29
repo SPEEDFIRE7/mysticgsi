@@ -1,0 +1,274 @@
+name: MysticGSI Build sized
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: 'Name for the build (out/<name>/)'
+        required: true
+        default: 'devicename-gsi'
+      firmware_url:
+        description: 'Firmware URL (Google Drive, Mega.nz, or direct link)'
+        required: true
+        default: ''
+      rom_type:
+        description: 'ROM patch set (--type), leave empty for generic'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -a -f || true
+          df -h
+
+      - name: Use the largest disk for the workspace
+        run: |
+          echo "=== Block devices ==="
+          lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT || true
+          echo "=== Free space per mount ==="
+          df -h -x tmpfs -x devtmpfs -x squashfs -x overlay
+
+          # Mount point with the most free space (real disks only)
+          BIG=$(df -B1 --output=avail,target \
+                  -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs \
+                | tail -n +2 | sort -rn | head -n1 | awk '{print $2}')
+          echo "Largest free-space mount: $BIG"
+
+          BIG_DEV=$(stat -c %d "$BIG")
+          WS_DEV=$(stat -c %d "$GITHUB_WORKSPACE")
+
+          if [ "$BIG_DEV" != "$WS_DEV" ]; then
+            echo "Workspace is on a smaller disk -> bind-mounting from $BIG"
+            sudo mkdir -p "$BIG/gsi-workspace"
+            sudo chown -R "$USER":"$(id -gn)" "$BIG/gsi-workspace"
+            sudo mount --bind "$BIG/gsi-workspace" "$GITHUB_WORKSPACE"
+            sudo chown "$USER":"$(id -gn)" "$GITHUB_WORKSPACE"
+          else
+            echo "Workspace is already on the largest disk"
+          fi
+
+          # Temp files also go to the big disk
+          sudo mkdir -p "$BIG/gsi-tmp"
+          sudo chown "$USER":"$(id -gn)" "$BIG/gsi-tmp"
+          echo "TMPDIR=$BIG/gsi-tmp" >> "$GITHUB_ENV"
+
+          echo "=== Workspace disk ==="
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+
+      - name: Debug - list checkout contents
+        run: |
+          pwd
+          ls -la
+          df -h .
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv erofs-utils aria2 patch \
+            default-jre-headless curl build-essential cmake ninja-build pkg-config \
+            perl golang-go libgtest-dev libusb-1.0-0-dev libpcre2-dev \
+            libprotobuf-dev protobuf-compiler libbrotli-dev liblz4-dev libzstd-dev \
+            libarchive-tools openssl file
+
+      - name: Install apktool
+        run: |
+          mkdir -p ~/.local/bin
+          ver=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+          curl -fL -o ~/.local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${ver}/apktool_${ver}.jar"
+          printf '#!/bin/sh\nexec java -jar "$HOME/.local/bin/apktool.jar" "$@"\n' > ~/.local/bin/apktool
+          chmod +x ~/.local/bin/apktool
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run setup
+        run: |
+          chmod +x setup_host.py
+          python3 setup_host.py
+
+      - name: Download firmware (auto-detect host)
+        run: |
+          URL="${{ github.event.inputs.firmware_url }}"
+          mkdir -p dl
+          echo "URL: $URL"
+          case "$URL" in
+            *drive.google.com*)
+              echo "Detected: Google Drive"
+              .venv/bin/python -m pip install -q gdown
+              mkdir -p ~/.cache/gdown
+              if [ -n "${{ secrets.GDRIVE_COOKIES }}" ]; then
+                echo "${{ secrets.GDRIVE_COOKIES }}" > ~/.cache/gdown/cookies.txt
+              fi
+              .venv/bin/python -m gdown "$URL" -O dl/firmware.bin
+              ;;
+            *mega.nz*|*mega.co.nz*)
+              echo "Detected: Mega.nz"
+              sudo apt-get install -y megatools
+              megadl --path dl "$URL"
+              ;;
+            *)
+              echo "Detected: direct link"
+              aria2c -d dl -o firmware.bin -x4 -s4 "$URL"
+              ;;
+          esac
+          echo "Downloaded contents:"
+          find dl -maxdepth 1 -type f -exec ls -lh {} \;
+          df -h .
+
+      - name: Extract firmware and locate super.img
+        run: |
+          DL_FILE=$(find dl -maxdepth 1 -type f | head -n1)
+          if [ -z "$DL_FILE" ]; then
+            echo "No file was downloaded."
+            exit 1
+          fi
+          echo "Downloaded file: $DL_FILE"
+          MIME=$(file -b "$DL_FILE")
+          echo "Detected type: $MIME"
+
+          mkdir -p firmware_extracted
+          case "$MIME" in
+            *Zip*|*ZIP*)
+              unzip -o "$DL_FILE" -d firmware_extracted
+              ;;
+            *RAR*)
+              sudo apt-get install -y unrar-free || true
+              if command -v unrar-free >/dev/null 2>&1; then
+                unrar-free x "$DL_FILE" firmware_extracted/
+              elif command -v unrar >/dev/null 2>&1; then
+                unrar x -o+ "$DL_FILE" firmware_extracted/
+              else
+                sudo apt-get install -y p7zip-full
+                7z x "$DL_FILE" -ofirmware_extracted
+              fi
+              ;;
+            *7-zip*)
+              sudo apt-get install -y p7zip-full
+              7z x "$DL_FILE" -ofirmware_extracted
+              ;;
+            *)
+              cp "$DL_FILE" firmware_extracted/
+              ;;
+          esac
+
+          # The archive is no longer needed -> free space for the build
+          rm -f "$DL_FILE"
+
+          echo "Extracted contents:"
+          find firmware_extracted -maxdepth 4 -type f -exec ls -lh {} \;
+
+          PAC_FILE=$(find firmware_extracted -type f -iname '*.pac' | head -n1)
+          # Some firmware (e.g. loose SPD "flash file" dumps) names the
+          # dynamic-partition image super.bin instead of super.img, so match
+          # both, and pick the largest match by size to avoid a decoy file.
+          SUPER_DIRECT=$(find firmware_extracted -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+
+          # mv instead of cp: avoids a second 10 GB copy on disk
+          if [ -n "$PAC_FILE" ]; then
+            echo "Found .pac: $PAC_FILE"
+            mv "$PAC_FILE" firmware.pac
+            echo "needs_pac_extract=true" >> "$GITHUB_ENV"
+          elif [ -n "$SUPER_DIRECT" ]; then
+            echo "Found super.img directly: $SUPER_DIRECT"
+            mv "$SUPER_DIRECT" firmware_super.img
+            echo "needs_pac_extract=false" >> "$GITHUB_ENV"
+          else
+            echo "No .pac or super.img found. Full listing:"
+            find firmware_extracted -type f
+            exit 1
+          fi
+          rm -rf firmware_extracted
+          df -h .
+
+      - name: Unpack super.img from the .pac
+        if: env.needs_pac_extract == 'true'
+        run: |
+          git clone --depth 1 https://github.com/bismoy-bot/PAC-Extractor.git pac-extractor
+          python3 pac-extractor/extractor.py firmware.pac pac_unpacked
+          echo "Extracted files:"
+          find pac_unpacked -maxdepth 2 -type f -exec ls -lh {} \;
+          SUPER_IMG=$(find pac_unpacked -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) | head -n1)
+          if [ -z "$SUPER_IMG" ]; then
+            echo "No super.img found after unpacking. Full listing:"
+            find pac_unpacked -type f
+            exit 1
+          fi
+          echo "Found: $SUPER_IMG"
+          mv "$SUPER_IMG" firmware_super.img
+          rm -rf pac_unpacked firmware.pac
+          df -h .
+
+      - name: Build GSI
+        run: |
+          TYPE_ARG=""
+          if [ -n "${{ github.event.inputs.rom_type }}" ]; then
+            TYPE_ARG="--type ${{ github.event.inputs.rom_type }}"
+          fi
+          .venv/bin/python cli.py build "${{ github.event.inputs.build_name }}" \
+            firmware_super.img $TYPE_ARG
+          df -h .
+
+      - name: Compress output with xz -9e
+        run: |
+          sudo apt-get install -y xz-utils
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          ls -lh "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -iname '*.img' -print0 | while IFS= read -r -d '' f; do
+            echo "Compressing: $f"
+            xz -9e -T0 -v "$f"
+          done
+          ls -lh "$OUT_DIR"
+
+      - name: Upload build to gofile.io
+        run: |
+          sudo apt-get install -y jq
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          LIMIT=2147483648  # GitHub's per-asset release limit (2 GiB)
+
+          find "$OUT_DIR" -maxdepth 1 -iname '*.xz' -print0 | while IFS= read -r -d '' f; do
+            SIZE=$(stat -c%s "$f")
+            echo "$f is $SIZE bytes -- uploading to gofile.io"
+            SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+            echo "Using gofile server: $SERVER"
+            RESPONSE=$(curl -s -F "file=@${f}" -F "token=${{ secrets.GOFILE_TOKEN }}" "https://${SERVER}.gofile.io/contents/uploadfile")
+            echo "gofile response: $RESPONSE"
+            LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage')
+            if [ -z "$LINK" ] || [ "$LINK" = "null" ]; then
+              echo "gofile upload failed"
+            else
+              echo "" >> "$OUT_DIR/output.txt"
+              echo "gofile.io mirror: $LINK" >> "$OUT_DIR/output.txt"
+            fi
+            if [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "Over the GitHub release limit -- removing from the release upload set"
+              rm -f "$f"
+            fi
+          done
+
+      - name: Prepare release tag
+        id: tag
+        run: echo "tag=gsi-${{ github.event.inputs.build_name }}-$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.event.inputs.build_name }}
+          body_path: out/${{ github.event.inputs.build_name }}/output.txt
+          files: |
+            out/${{ github.event.inputs.build_name }}/*.xz
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
