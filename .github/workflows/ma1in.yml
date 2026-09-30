@@ -226,7 +226,7 @@ jobs:
             out/${{ github.event.inputs.build_name }}/*.xz
           generate_release_notes: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}: MysticGSI Build
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 on:
   workflow_dispatch:
