@@ -1,0 +1,128 @@
+name: EXT4 to EROFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: "رابط مباشر لملف ext4 (system.img / vendor.img ...)"
+        required: true
+        type: string
+      name:
+        description: "اسم الناتج (بدون .img)"
+        required: true
+        default: "system"
+        type: string
+      compression:
+        description: "نوع الضغط"
+        required: true
+        default: "lz4hc,9"
+        type: choice
+        options:
+          - "lz4hc,9"
+          - "lz4"
+          - "lzma,6"
+          - "zstd,15"
+          - "none"
+      release:
+        description: "رفع الناتج إلى GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erofs-utils android-sdk-libsparse-utils aria2 xz-utils
+
+      - name: Download image
+        run: |
+          mkdir -p work out
+          aria2c -x16 -s16 -o input.img -d work "${{ inputs.image_url }}"
+          ls -lh work
+
+      - name: Unsparse if needed
+        run: |
+          cd work
+          # الصور المتناثرة (sparse) تبدأ بالبايتات 3aff26ed
+          if [ "$(head -c4 input.img | xxd -p)" = "3aff26ed" ]; then
+            echo "Sparse image detected"
+            simg2img input.img raw.img
+            rm input.img
+          else
+            mv input.img raw.img
+          fi
+          file raw.img
+
+      - name: Mount ext4
+        run: |
+          sudo mkdir -p /mnt/ext4
+          sudo mount -o loop,ro work/raw.img /mnt/ext4
+          sudo du -sh /mnt/ext4
+
+      - name: Build EROFS
+        run: |
+          OUT="out/${{ inputs.name }}.img"
+          if [ "${{ inputs.compression }}" = "none" ]; then
+            COMP=""
+          else
+            COMP="-z${{ inputs.compression }}"
+          fi
+          # sudo للحفاظ على الصلاحيات والـ xattr (SELinux / capabilities)
+          sudo mkfs.erofs $COMP -b 4096 -T 1230768000 \
+            --mount-point="/${{ inputs.name }}" \
+            "$OUT" /mnt/ext4
+          sudo chown $USER "$OUT"
+          ls -lh out
+
+      - name: Verify
+        run: |
+          sudo umount /mnt/ext4
+          fsck.erofs out/${{ inputs.name }}.img || true
+          sha256sum out/${{ inputs.name }}.img | tee out/${{ inputs.name }}.sha256
+
+      - name: Split if larger than 1.9GB
+        run: |
+          cd out
+          f="${{ inputs.name }}.img"
+          if [ "$(stat -c%s "$f")" -gt 1991000000 ]; then
+            split -b 1900M -d "$f" "$f.part"
+            rm "$f"
+          fi
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.name }}-erofs
+          path: out/*
+          compression-level: 0
+
+      - name: Upload to gofile.io
+        run: |
+          for f in out/*; do
+            echo "Uploading $f"
+            RES=$(curl -s -F "file=@$f" https://upload.gofile.io/uploadfile)
+            echo "$RES"
+            LINK=$(echo "$RES" | jq -r '.data.downloadPage')
+            echo "- $(basename "$f"): $LINK" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: erofs-${{ inputs.name }}-${{ github.run_number }}
+          name: ${{ inputs.name }} EROFS #${{ github.run_number }}
+          files: out/*
