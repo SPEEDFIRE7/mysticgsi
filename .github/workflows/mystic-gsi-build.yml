@@ -6,9 +6,9 @@ on:
       build_name:
         description: 'Name for the build (out/<name>/)'
         required: true
-        default: 'devicename-gsi'
+        default: ''
       firmware_url:
-        description: 'Firmware URL (Google Drive, Mega.nz, or direct link)'
+        description: 'Firmware URL (Google Drive, Mega.nz, Pixeldrain, or direct link)'
         required: true
         default: ''
       rom_type:
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: namespace-profile-kyros
     timeout-minutes: 350
     steps:
       - name: Free up disk space
@@ -51,7 +51,7 @@ jobs:
       - name: Install apktool
         run: |
           mkdir -p ~/.local/bin
-          ver=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+          ver=$(curl -fsSL --retry 3 -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
           curl -fL -o ~/.local/bin/apktool.jar \
             "https://github.com/iBotPeaches/Apktool/releases/download/v${ver}/apktool_${ver}.jar"
           printf '#!/bin/sh\nexec java -jar "$HOME/.local/bin/apktool.jar" "$@"\n' > ~/.local/bin/apktool
@@ -81,7 +81,24 @@ jobs:
             *mega.nz*|*mega.co.nz*)
               echo "Detected: Mega.nz"
               sudo apt-get install -y megatools
+              if [ -n "${{ secrets.MEGA_EMAIL }}" ] && [ -n "${{ secrets.MEGA_PASSWORD }}" ]; then
+                echo "Logging in with Mega account to avoid anonymous-download throttling"
+                printf '[Login]\nUsername = %s\nPassword = %s\n' \
+                  "${{ secrets.MEGA_EMAIL }}" "${{ secrets.MEGA_PASSWORD }}" > ~/.megarc
+              fi
               megadl --path dl "$URL"
+              ;;
+            *pixeldrain.com*)
+              echo "Detected: Pixeldrain"
+              PD_ID=$(echo "$URL" | grep -oP 'pixeldrain\.com/u/\K[A-Za-z0-9]+' || true)
+              if [ -n "$PD_ID" ]; then
+                DIRECT_URL="https://pixeldrain.com/api/file/${PD_ID}?download"
+                echo "Converted share link to direct: $DIRECT_URL"
+              else
+                DIRECT_URL="$URL"
+                echo "Already a direct/API link, using as-is"
+              fi
+              aria2c -d dl -o firmware.bin -x4 -s4 "$DIRECT_URL"
               ;;
             *)
               echo "Detected: direct link"
@@ -91,7 +108,7 @@ jobs:
           echo "Downloaded contents:"
           find dl -maxdepth 1 -type f -exec ls -lh {} \;
 
-      - name: Extract firmware and locate super.img
+      - name: Extract firmware and identify build input
         run: |
           DL_FILE=$(find dl -maxdepth 1 -type f | head -n1)
           if [ -z "$DL_FILE" ]; then
@@ -104,7 +121,7 @@ jobs:
 
           mkdir -p firmware_extracted
           case "$MIME" in
-            *Zip*|*ZIP*)
+            *Zip*|*ZIP*|*Java\ archive*|*JAR*)
               unzip -o "$DL_FILE" -d firmware_extracted
               ;;
             *RAR*)
@@ -130,41 +147,52 @@ jobs:
           echo "Extracted contents:"
           find firmware_extracted -maxdepth 4 -type f -exec ls -lh {} \;
 
+          PAYLOAD_FILE=$(find firmware_extracted -type f -iname 'payload.bin' | head -n1)
           PAC_FILE=$(find firmware_extracted -type f -iname '*.pac' | head -n1)
+          AP_TAR=$(find firmware_extracted -type f -iname 'AP_*.tar.md5' | head -n1)
           # Some firmware (e.g. loose SPD "flash file" dumps) names the
           # dynamic-partition image super.bin instead of super.img, so match
           # both, and pick the largest match by size to avoid a decoy file.
           SUPER_DIRECT=$(find firmware_extracted -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
 
-          if [ -n "$PAC_FILE" ]; then
-            echo "Found .pac: $PAC_FILE"
+          if [ -n "$PAYLOAD_FILE" ]; then
+            # MysticGSI natively supports full OTA zips containing payload.bin --
+            # hand it the original downloaded zip rather than the loose payload.bin.
+            echo "Found payload.bin OTA package: $PAYLOAD_FILE"
+            cp "$DL_FILE" firmware_input.zip
+            echo "firmware_mode=payload" >> "$GITHUB_ENV"
+          elif [ -n "$PAC_FILE" ]; then
+            echo "Found .pac: $PAC_FILE -- unpacking super.img from it"
             cp "$PAC_FILE" firmware.pac
-            echo "needs_pac_extract=true" >> "$GITHUB_ENV"
+            git clone --depth 1 https://github.com/bismoy-bot/PAC-Extractor.git pac-extractor
+            python3 pac-extractor/extractor.py firmware.pac pac_unpacked
+            echo "PAC-extracted files:"
+            find pac_unpacked -maxdepth 2 -type f -exec ls -lh {} \;
+            SUPER_IMG=$(find pac_unpacked -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) | head -n1)
+            if [ -z "$SUPER_IMG" ]; then
+              echo "No super.img found after unpacking the .pac. Full listing:"
+              find pac_unpacked -type f
+              exit 1
+            fi
+            echo "Found: $SUPER_IMG"
+            cp "$SUPER_IMG" firmware_super.img
+            echo "firmware_mode=super" >> "$GITHUB_ENV"
+          elif [ -n "$AP_TAR" ]; then
+            # Samsung's AP tar ships with a .md5 checksum suffix appended to
+            # the filename; stripping it gives a normal .tar that MysticGSI
+            # reads natively as a Samsung firmware source.
+            echo "Found Samsung AP tar: $AP_TAR"
+            cp "$AP_TAR" firmware_ap.tar
+            echo "firmware_mode=samsung" >> "$GITHUB_ENV"
           elif [ -n "$SUPER_DIRECT" ]; then
             echo "Found super.img directly: $SUPER_DIRECT"
             cp "$SUPER_DIRECT" firmware_super.img
-            echo "needs_pac_extract=false" >> "$GITHUB_ENV"
+            echo "firmware_mode=super" >> "$GITHUB_ENV"
           else
-            echo "No .pac or super.img found. Full listing:"
+            echo "No payload.bin, .pac, Samsung AP tar, or super.img found. Full listing:"
             find firmware_extracted -type f
             exit 1
           fi
-
-      - name: Unpack super.img from the .pac
-        if: env.needs_pac_extract == 'true'
-        run: |
-          git clone --depth 1 https://github.com/bismoy-bot/PAC-Extractor.git pac-extractor
-          python3 pac-extractor/extractor.py firmware.pac pac_unpacked
-          echo "Extracted files:"
-          find pac_unpacked -maxdepth 2 -type f -exec ls -lh {} \;
-          SUPER_IMG=$(find pac_unpacked -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) | head -n1)
-          if [ -z "$SUPER_IMG" ]; then
-            echo "No super.img found after unpacking. Full listing:"
-            find pac_unpacked -type f
-            exit 1
-          fi
-          echo "Found: $SUPER_IMG"
-          cp "$SUPER_IMG" firmware_super.img
 
       - name: Build GSI
         run: |
@@ -172,8 +200,20 @@ jobs:
           if [ -n "${{ github.event.inputs.rom_type }}" ]; then
             TYPE_ARG="--type ${{ github.event.inputs.rom_type }}"
           fi
+          case "$firmware_mode" in
+            payload)
+              FIRMWARE_INPUT=firmware_input.zip
+              ;;
+            samsung)
+              FIRMWARE_INPUT=firmware_ap.tar
+              ;;
+            *)
+              FIRMWARE_INPUT=firmware_super.img
+              ;;
+          esac
+          echo "Building from: $FIRMWARE_INPUT (mode: $firmware_mode)"
           .venv/bin/python cli.py build "${{ github.event.inputs.build_name }}" \
-            firmware_super.img $TYPE_ARG
+            "$FIRMWARE_INPUT" $TYPE_ARG
 
       - name: Compress output with xz -9e
         run: |

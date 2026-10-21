@@ -1,0 +1,70 @@
+name: Build A17 BPF/apex modules
+
+# Runs the AyakaUI flow from scripts/ayaka.sh (sync, gsi-patches, product generation) and builds only
+# com.android.tethering (netbpfload + BPF progs + connectivity jars), apexd and netd,
+# then publishes them as a GitHub release to be dropped into patches/37/hyperos.
+
+run-name: Build A17 BPF modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      modules:
+        description: 'Modules to build'
+        default: 'com.android.tethering apexd netd'
+      redo:
+        description: 'Phases to redo (fetch sync patch product); empty on a fresh runner'
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: namespace-profile-kyros
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk and CPU
+        run: |
+          df -h / "$HOME" 2>/dev/null || true
+          nproc; free -g | head -2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git git-lfs gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev-i386 libncurses-dev x11proto-core-dev libx11-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip fontconfig python3 rsync bc lz4 xz-utils patch libssl-dev ccache
+          git lfs install
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+
+      - name: Build modules
+        env:
+          GH_TOKEN: ${{ secrets.ROM_REPO_TOKEN }}
+          MODULES: ${{ github.event.inputs.modules }}
+          REDO: ${{ github.event.inputs.redo }}
+        run: |
+          export PATH="$HOME/bin:$PATH"
+          export W="$HOME/work"
+          set -o pipefail
+          # stream the output and, if the build reports an error, attach its last 80 lines as one annotation
+          bash scripts/build-a17-modules.sh 2>&1 | awk '
+            { print; fflush(); l=$0; gsub(/\r/,"",l); gsub(/\033\[[0-9;]*m/,"",l); buf[NR%80]=l
+              if (l ~ /error:|ERROR:|FAILED|Build Failure|failed to build/) bad=1 }
+            END { if (bad) { s=""; for (i=NR-79;i<=NR;i++) if (i>0) { x=buf[i%80]; gsub(/%/,"%25",x); s=s x "%0A" }
+                  print "::error title=build output (last 80 lines)::" s } }'
+          echo "ARCHIVE=$W/a17-bpf-modules.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          type gh >/dev/null 2>&1 || sudo apt-get install -y gh
+          gh release create "a17-bpf-${{ github.run_number }}" "$ARCHIVE" \
+            --repo "${{ github.repository }}" \
+            --title "A17 BPF/apex modules #${{ github.run_number }}" \
+            --notes "AyakaUI seventeen + gsi-patches pixelos, modules: ${{ github.event.inputs.modules }}"
