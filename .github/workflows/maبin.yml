@@ -187,7 +187,9 @@ jobs:
             # Stage 1: undo Brotli -> sparse "new data" stream.
             brotli -d -f -o system.new.dat "$SYS_BR"
             cp "$SYS_TRANSFER" system.transfer.list
-            # Stage 2: replay the transfer list into a raw ext4/erofs image.
+            # Stage 2: replay the transfer list into a raw image.
+            # The output must be named system.img: the extractor takes the
+            # partition name from the part of the filename before the first dot.
             cat > sparse_to_img.py << 'PYEOF'
           #!/usr/bin/env python3
           # Converts an Android sparse transfer list + new data stream into a
@@ -250,9 +252,9 @@ jobs:
                   sys.exit('usage: sparse_to_img.py <transfer.list> <new.dat> <out.img>')
               main(*sys.argv[1:4])
           PYEOF
-            python3 sparse_to_img.py system.transfer.list system.new.dat firmware_system.img
+            python3 sparse_to_img.py system.transfer.list system.new.dat system.img
             rm -f system.new.dat
-            ls -lh firmware_system.img
+            ls -lh system.img
             echo "firmware_mode=system" >> "$GITHUB_ENV"
           else
             echo "No payload.bin, .pac, Samsung AP tar, super.img, or system.dat.br + system.transfer.list found. Full listing:"
@@ -273,7 +275,7 @@ jobs:
               FIRMWARE_INPUT=firmware_ap.tar
               ;;
             system)
-              FIRMWARE_INPUT=firmware_system.img
+              FIRMWARE_INPUT=system.img
               ;;
             *)
               FIRMWARE_INPUT=firmware_super.img
