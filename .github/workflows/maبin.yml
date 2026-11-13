@@ -1,0 +1,333 @@
+name: MysticGSI Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: 'Name for the build (out/<name>/)'
+        required: true
+        default: ''
+      firmware_url:
+        description: 'Firmware URL (Google Drive, Mega.nz, Pixeldrain, or direct link)'
+        required: true
+        default: ''
+      rom_type:
+        description: 'ROM patch set (--type), leave empty for generic'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -a -f || true
+          df -h
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+
+      - name: Debug - list checkout contents
+        run: |
+          pwd
+          ls -la
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv erofs-utils aria2 patch \
+            default-jre-headless curl build-essential cmake ninja-build pkg-config \
+            perl golang-go libgtest-dev libusb-1.0-0-dev libpcre2-dev \
+            libprotobuf-dev protobuf-compiler libbrotli-dev liblz4-dev libzstd-dev \
+            libarchive-tools openssl file brotli
+      - name: Install apktool
+        run: |
+          mkdir -p ~/.local/bin
+          ver=$(curl -fsSL --retry 3 -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+          curl -fL -o ~/.local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${ver}/apktool_${ver}.jar"
+          printf '#!/bin/sh\nexec java -jar "$HOME/.local/bin/apktool.jar" "$@"\n' > ~/.local/bin/apktool
+          chmod +x ~/.local/bin/apktool
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run setup
+        run: |
+          chmod +x setup_host.py
+          python3 setup_host.py
+      - name: Download firmware (auto-detect host)
+        run: |
+          URL="${{ github.event.inputs.firmware_url }}"
+          mkdir -p dl
+          echo "URL: $URL"
+          case "$URL" in
+            *drive.google.com*)
+              echo "Detected: Google Drive"
+              .venv/bin/python -m pip install -q gdown
+              mkdir -p ~/.cache/gdown
+              if [ -n "${{ secrets.GDRIVE_COOKIES }}" ]; then
+                echo "${{ secrets.GDRIVE_COOKIES }}" > ~/.cache/gdown/cookies.txt
+              fi
+              .venv/bin/python -m gdown "$URL" -O dl/firmware.bin
+              ;;
+            *mega.nz*|*mega.co.nz*)
+              echo "Detected: Mega.nz"
+              sudo apt-get install -y megatools
+              if [ -n "${{ secrets.MEGA_EMAIL }}" ] && [ -n "${{ secrets.MEGA_PASSWORD }}" ]; then
+                echo "Logging in with Mega account to avoid anonymous-download throttling"
+                printf '[Login]\nUsername = %s\nPassword = %s\n' \
+                  "${{ secrets.MEGA_EMAIL }}" "${{ secrets.MEGA_PASSWORD }}" > ~/.megarc
+              fi
+              megadl --path dl "$URL"
+              ;;
+            *pixeldrain.com*)
+              echo "Detected: Pixeldrain"
+              PD_ID=$(echo "$URL" | grep -oP 'pixeldrain\.com/u/\K[A-Za-z0-9]+' || true)
+              if [ -n "$PD_ID" ]; then
+                DIRECT_URL="https://pixeldrain.com/api/file/${PD_ID}?download"
+                echo "Converted share link to direct: $DIRECT_URL"
+              else
+                DIRECT_URL="$URL"
+                echo "Already a direct/API link, using as-is"
+              fi
+              aria2c -d dl -o firmware.bin -x4 -s4 "$DIRECT_URL"
+              ;;
+            *)
+              echo "Detected: direct link"
+              aria2c -d dl -o firmware.bin -x4 -s4 "$URL"
+              ;;
+          esac
+          echo "Downloaded contents:"
+          find dl -maxdepth 1 -type f -exec ls -lh {} \;
+      - name: Extract firmware and identify build input
+        run: |
+          DL_FILE=$(find dl -maxdepth 1 -type f | head -n1)
+          if [ -z "$DL_FILE" ]; then
+            echo "No file was downloaded."
+            exit 1
+          fi
+          echo "Downloaded file: $DL_FILE"
+          MIME=$(file -b "$DL_FILE")
+          echo "Detected type: $MIME"
+          mkdir -p firmware_extracted
+          case "$MIME" in
+            *Zip*|*ZIP*|*Java\ archive*|*JAR*)
+              unzip -o "$DL_FILE" -d firmware_extracted
+              ;;
+            *RAR*)
+              sudo apt-get install -y unrar-free || true
+              if command -v unrar-free >/dev/null 2>&1; then
+                unrar-free x "$DL_FILE" firmware_extracted/
+              elif command -v unrar >/dev/null 2>&1; then
+                unrar x -o+ "$DL_FILE" firmware_extracted/
+              else
+                sudo apt-get install -y p7zip-full
+                7z x "$DL_FILE" -ofirmware_extracted
+              fi
+              ;;
+            *7-zip*)
+              sudo apt-get install -y p7zip-full
+              7z x "$DL_FILE" -ofirmware_extracted
+              ;;
+            *)
+              cp "$DL_FILE" firmware_extracted/
+              ;;
+          esac
+          echo "Extracted contents:"
+          find firmware_extracted -maxdepth 4 -type f -exec ls -lh {} \;
+          PAYLOAD_FILE=$(find firmware_extracted -type f -iname 'payload.bin' | head -n1)
+          PAC_FILE=$(find firmware_extracted -type f -iname '*.pac' | head -n1)
+          AP_TAR=$(find firmware_extracted -type f -iname 'AP_*.tar.md5' | head -n1)
+          # Some firmware (e.g. loose SPD "flash file" dumps) names the
+          # dynamic-partition image super.bin instead of super.img, so match
+          # both, and pick the largest match by size to avoid a decoy file.
+          SUPER_DIRECT=$(find firmware_extracted -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+          # Brotli-compressed sparse system image: system.dat.br (plus the
+          # system.transfer.list that maps its blocks onto the raw image).
+          SYS_BR=$(find firmware_extracted -type f \( -iname 'system.dat.br' -o -iname 'system.new.dat.br' \) | head -n1)
+          SYS_TRANSFER=$(find firmware_extracted -type f -iname 'system.transfer.list' | head -n1)
+          if [ -n "$PAYLOAD_FILE" ]; then
+            # MysticGSI natively supports full OTA zips containing payload.bin --
+            # hand it the original downloaded zip rather than the loose payload.bin.
+            echo "Found payload.bin OTA package: $PAYLOAD_FILE"
+            cp "$DL_FILE" firmware_input.zip
+            echo "firmware_mode=payload" >> "$GITHUB_ENV"
+          elif [ -n "$PAC_FILE" ]; then
+            echo "Found .pac: $PAC_FILE -- unpacking super.img from it"
+            cp "$PAC_FILE" firmware.pac
+            git clone --depth 1 https://github.com/bismoy-bot/PAC-Extractor.git pac-extractor
+            python3 pac-extractor/extractor.py firmware.pac pac_unpacked
+            echo "PAC-extracted files:"
+            find pac_unpacked -maxdepth 2 -type f -exec ls -lh {} \;
+            SUPER_IMG=$(find pac_unpacked -type f \( -iname 'super*.img' -o -iname 'super*.bin' \) | head -n1)
+            if [ -z "$SUPER_IMG" ]; then
+              echo "No super.img found after unpacking the .pac. Full listing:"
+              find pac_unpacked -type f
+              exit 1
+            fi
+            echo "Found: $SUPER_IMG"
+            cp "$SUPER_IMG" firmware_super.img
+            echo "firmware_mode=super" >> "$GITHUB_ENV"
+          elif [ -n "$AP_TAR" ]; then
+            # Samsung's AP tar ships with a .md5 checksum suffix appended to
+            # the filename; stripping it gives a normal .tar that MysticGSI
+            # reads natively as a Samsung firmware source.
+            echo "Found Samsung AP tar: $AP_TAR"
+            cp "$AP_TAR" firmware_ap.tar
+            echo "firmware_mode=samsung" >> "$GITHUB_ENV"
+          elif [ -n "$SUPER_DIRECT" ]; then
+            echo "Found super.img directly: $SUPER_DIRECT"
+            cp "$SUPER_DIRECT" firmware_super.img
+            echo "firmware_mode=super" >> "$GITHUB_ENV"
+          elif [ -n "$SYS_BR" ] && [ -n "$SYS_TRANSFER" ]; then
+            echo "Found Brotli sparse system: $SYS_BR (transfer list: $SYS_TRANSFER)"
+            # Stage 1: undo Brotli -> sparse "new data" stream.
+            brotli -d -f -o system.new.dat "$SYS_BR"
+            cp "$SYS_TRANSFER" system.transfer.list
+            # Stage 2: replay the transfer list into a raw ext4/erofs image.
+            cat > sparse_to_img.py << 'PYEOF'
+          #!/usr/bin/env python3
+          # Converts an Android sparse transfer list + new data stream into a
+          # raw image. Supports full-OTA commands only: new, zero, erase, stash,
+          # free. Incremental commands (move, bsdiff, imgdiff) mean the input is
+          # a delta and cannot produce a standalone image, so we fail closed.
+          import sys
+
+          BLOCK = 4096
+          CHUNK = 1 << 20
+
+
+          def parse_ranges(spec):
+              # Range set format: "<count>,<v0>,<v1>,..." -> [(v0,v1), ...]
+              count, *vals = spec.split(',')
+              vals = list(map(int, vals[:int(count)]))
+              return list(zip(vals[0::2], vals[1::2]))
+
+
+          def main(transfer_path, data_path, out_path):
+              with open(transfer_path) as tl:
+                  version = int(tl.readline())
+                  total_blocks = int(tl.readline())
+                  if version >= 2:
+                      tl.readline()  # stash entries
+                      tl.readline()  # max stash blocks
+
+                  written = 0
+                  with open(data_path, 'rb') as src, open(out_path, 'wb') as out:
+                      # Sparse file: unwritten regions read back as zero.
+                      out.truncate(total_blocks * BLOCK)
+                      for line in tl:
+                          parts = line.split()
+                          if not parts:
+                              continue
+                          cmd = parts[0]
+                          if cmd == 'new':
+                              for start, end in parse_ranges(parts[1]):
+                                  out.seek(start * BLOCK)
+                                  remaining = (end - start) * BLOCK
+                                  while remaining > 0:
+                                      chunk = src.read(min(CHUNK, remaining))
+                                      if not chunk:
+                                          sys.exit('error: new data stream ended early')
+                                      out.write(chunk)
+                                      remaining -= len(chunk)
+                                      written += len(chunk)
+                          elif cmd in ('zero', 'erase', 'stash', 'free'):
+                              continue  # already zero from truncate, or bookkeeping
+                          elif cmd in ('move', 'bsdiff', 'imgdiff'):
+                              sys.exit(f'error: incremental command "{cmd}" found, need a full OTA')
+                          else:
+                              sys.exit(f'error: unknown transfer command "{cmd}"')
+
+              print(f'wrote {written} data bytes into {out_path} ({total_blocks * BLOCK} bytes total)')
+
+
+          if __name__ == '__main__':
+              if len(sys.argv) != 4:
+                  sys.exit('usage: sparse_to_img.py <transfer.list> <new.dat> <out.img>')
+              main(*sys.argv[1:4])
+          PYEOF
+            python3 sparse_to_img.py system.transfer.list system.new.dat firmware_system.img
+            rm -f system.new.dat
+            ls -lh firmware_system.img
+            echo "firmware_mode=system" >> "$GITHUB_ENV"
+          else
+            echo "No payload.bin, .pac, Samsung AP tar, super.img, or system.dat.br + system.transfer.list found. Full listing:"
+            find firmware_extracted -type f
+            exit 1
+          fi
+      - name: Build GSI
+        run: |
+          TYPE_ARG=""
+          if [ -n "${{ github.event.inputs.rom_type }}" ]; then
+            TYPE_ARG="--type ${{ github.event.inputs.rom_type }}"
+          fi
+          case "$firmware_mode" in
+            payload)
+              FIRMWARE_INPUT=firmware_input.zip
+              ;;
+            samsung)
+              FIRMWARE_INPUT=firmware_ap.tar
+              ;;
+            system)
+              FIRMWARE_INPUT=firmware_system.img
+              ;;
+            *)
+              FIRMWARE_INPUT=firmware_super.img
+              ;;
+          esac
+          echo "Building from: $FIRMWARE_INPUT (mode: $firmware_mode)"
+          .venv/bin/python cli.py build "${{ github.event.inputs.build_name }}" \
+            "$FIRMWARE_INPUT" $TYPE_ARG
+      - name: Compress output with xz -9e
+        run: |
+          sudo apt-get install -y xz-utils
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          ls -lh "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -iname '*.img' -print0 | while IFS= read -r -d '' f; do
+            echo "Compressing: $f"
+            xz -9e -T0 -v "$f"
+          done
+          ls -lh "$OUT_DIR"
+      - name: Upload build to gofile.io
+        run: |
+          sudo apt-get install -y jq
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          LIMIT=2147483648  # GitHub's per-asset release limit (2 GiB)
+          find "$OUT_DIR" -maxdepth 1 -iname '*.xz' -print0 | while IFS= read -r -d '' f; do
+            SIZE=$(stat -c%s "$f")
+            echo "$f is $SIZE bytes -- uploading to gofile.io"
+            SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+            echo "Using gofile server: $SERVER"
+            RESPONSE=$(curl -s -F "file=@${f}" -F "token=${{ secrets.GOFILE_TOKEN }}" "https://${SERVER}.gofile.io/contents/uploadfile")
+            echo "gofile response: $RESPONSE"
+            LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage')
+            if [ -z "$LINK" ] || [ "$LINK" = "null" ]; then
+              echo "gofile upload failed"
+            else
+              echo "" >> "$OUT_DIR/output.txt"
+              echo "gofile.io mirror: $LINK" >> "$OUT_DIR/output.txt"
+            fi
+            if [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "Over the GitHub release limit -- removing from the release upload set"
+              rm -f "$f"
+            fi
+          done
+      - name: Prepare release tag
+        id: tag
+        run: echo "tag=gsi-${{ github.event.inputs.build_name }}-$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.event.inputs.build_name }}
+          body_path: out/${{ github.event.inputs.build_name }}/output.txt
+          files: |
+            out/${{ github.event.inputs.build_name }}/*.xz
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
